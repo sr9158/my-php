@@ -3,16 +3,15 @@ name: Build and Push PHP Docker Image
 on:
   push:
     branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
+    paths:
+      - 'Dockerfile'       # 只有 Dockerfile 变化时才触发 push 构建
   schedule:
-    # 每天 UTC 04:00 (北京时间 12:00) 自动重建，以获取最新的官方 PHP 基础镜像
-    - cron: '0 4 * * *'
-  workflow_dispatch:   # 支持在 Actions 页面手动触发
+    - cron: '0 4 * * *'    # 每天定时检查官方基础镜像是否有更新
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}   # 自动使用 sr9158/my-php
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build-and-push:
@@ -28,8 +27,34 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Get Base Image Digest and Dockerfile Hash
+        id: get-hash
+        run: |
+          # 1. 提取 Dockerfile 中的 FROM 镜像名称 (如 php:8.5-apache)
+          BASE_IMAGE=$(grep -i '^FROM' Dockerfile | awk '{print $2}' | head -n 1)
+          echo "🔍 基础镜像: $BASE_IMAGE"
+          
+          # 2. 获取该镜像在官方仓库的最新 Digest 指纹
+          # 使用 buildx imagetools 查询，无需拉取整个镜像，速度极快
+          IMAGE_DIGEST=$(docker buildx imagetools inspect "$BASE_IMAGE" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "🔑 基础镜像最新指纹: $IMAGE_DIGEST"
+          
+          # 3. 计算 Dockerfile 自身的哈希
+          DF_HASH=$(sha256sum Dockerfile | awk '{print $1}')
+          echo "📄 Dockerfile 哈希: $DF_HASH"
+          
+          # 组合成一个最终的 Key
+          echo "final_key=$DF_HASH-$IMAGE_DIGEST" >> $GITHUB_OUTPUT
+
+      - name: Check Build Cache
+        id: cache-check
+        uses: actions/cache@v4
+        with:
+          path: /tmp/build-marker
+          key: php-build-${{ steps.get-hash.outputs.final_key }}
+
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
+        if: steps.cache-check.outputs.cache-hit != 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -37,6 +62,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata (tags, labels)
+        if: steps.cache-check.outputs.cache-hit != 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -49,13 +75,20 @@ jobs:
             latest
 
       - name: Build and push multi-arch image
+        if: steps.cache-check.outputs.cache-hit != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Mark Build as Success
+        if: steps.cache-check.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/build-marker
+          echo "done" > /tmp/build-marker/success
